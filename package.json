@@ -1,0 +1,33 @@
+{
+  "name": "appcache-to-service-worker",
+  "version": "1.0.0",
+  "description": "A service worker that mimics the behavior defined in a page's App Cache manifest.",
+  "keywords": [
+    "appcache",
+    "service worker",
+    "sw",
+    "offline",
+    "manifest"
+  ],
+  "author": {
+    "name": "Jeff Posnick",
+    "email": "jeffy@google.com",
+    "url": "https://jeffy.info"
+  },
+  "license": "Apache-2.0",
+  "devDependencies": {
+    "browserify": "^13.0.0",
+    "del": "^2.2.0",
+    "eslint-config-google": "^0.4.0",
+    "gulp": "^3.9.1",
+    "gulp-eslint": "^2.0.0",
+    "idb": "^1.1.0",
+    "parse-appcache-manifest": "^0.2.0",
+    "run-sequence": "^1.1.5",
+    "vinyl-buffer": "^1.0.0",
+    "vinyl-source-stream": "^1.1.0"
+  },
+  "engines": {
+    "node": ">=5.0.0"
+  }
+}
