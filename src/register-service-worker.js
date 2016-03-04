@@ -36,12 +36,36 @@ if (manifestAttribute && 'serviceWorker' in navigator) {
  */
 function addToCache(urls) {
   return caches.open(constants.CACHE_NAME).then(function(cache) {
-    return cache.addAll(urls.map(function(url) {
-      // These caching requests need to always result in a fetch() even if
-      // there's a service worker that might otherwise treat them differently.
-      // Let's use this special request header to let the service worker know.
-      return new Request(url, {headers: {'X-Use-Network': true}});
-    }));
+    var fetchRequests = urls.map(function(url) {
+      // See Item 18.3 of https://html.spec.whatwg.org/multipage/browsers.html#downloading-or-updating-an-application-cache
+      return fetch(new Request(url, {
+        credentials: 'include',
+        headers: {
+          'X-Use-Fetch': true
+        },
+        mode: 'no-cors',
+        redirect: 'manual',
+        referrer: 'no-referrer'
+      })).then(function(response) {
+        // See Item 18.5 of https://html.spec.whatwg.org/multipage/browsers.html#downloading-or-updating-an-application-cache
+        if (response.status === 404 ||
+          response.status === 410 ||
+          response.headers.get('Cache-Control').indexOf('no-store') !== -1) {
+          return cache.delete(url);
+        }
+
+        if (response.ok) {
+          return cache.put(url, response);
+        }
+
+        // Do nothing if the response status !== 200,404,410, which will
+        // continue to use the old item.
+      }).catch(function(error) {
+        // Do nothing, which will continue to use the old cached item.
+      });
+    });
+
+    return Promise.all(fetchRequests);
   });
 }
 
@@ -58,8 +82,20 @@ function handlePossibleManifestUpdate(db, manifestUrl) {
   var store = tx.objectStore(
     constants.OBJECT_STORES.MANIFEST_URL_TO_CONTENTS);
 
+  // See Item 4 of https://html.spec.whatwg.org/multipage/browsers.html#downloading-or-updating-an-application-cache
+  var manifestRequest = new Request(manifestUrl, {
+    credentials: 'include',
+    headers: {
+      'X-Use-Fetch': true
+    },
+    mode: 'no-cors',
+    referrer: 'no-referrer'
+  });
+
   return Promise.all([
-    fetch(manifestUrl).then(function(manifestResponse) {
+    // TODO: Handle manifest fetch failure errors.
+    // TODO: Consider cache-busting if the manifest response > 24 hours old.
+    fetch(manifestRequest).then(function(manifestResponse) {
       return manifestResponse.text();
     }),
     store.get(manifestUrl).then(function(idbEntryForManifest) {

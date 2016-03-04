@@ -92,11 +92,10 @@
     const requestUrl = event.request.url;
     console.debug('Starting appCacheBehaviorForUrl for', requestUrl);
 
-    // If this is a request stemming from the CACHE or FALLBACK section of an
-    // AppCache manifest, used to initially populate the caches, then always
-    // use fetch().
-    if (event.request.headers.get('X-Use-Network') === 'true') {
-      console.debug('Using fetch() because X-Use-Network: true');
+    // If this is a request that, as per the AppCache spec, should be handled
+    // via a direct fetch(), then do that and bail early.
+    if (event.request.headers.get('X-Use-Fetch') === 'true') {
+      console.debug('Using fetch() because X-Use-Fetch: true');
       return fetch(event.request);
     }
 
@@ -110,16 +109,6 @@
             constants.OBJECT_STORES.PATH_TO_MANIFEST);
           return store.get(clientUrl).then(manifestUrl => {
             console.debug('manifestUrl is', manifestUrl);
-            // If this is a request for the AppCache manifest, that's simple.
-            if (manifestUrl === event.request.url) {
-              console.debug('manifestUrl matches; using fetch(event.request)');
-              // fetch() might get a copy from the browser cache. While this
-              // matches AppCache behavior, one of the enhancements
-              // in this library would be to get a fresh copy from the network
-              // iff the cached copy is more than 24 hours old.
-              // TODO: Implement that conditional cache busting.
-              return fetch(event.request);
-            }
 
             // Now, the complicated bit. First, see if we have a manifest
             // associated with the client. I.e., is manifestUrl defined?
