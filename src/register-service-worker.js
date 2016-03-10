@@ -8,19 +8,10 @@ var manifestAttribute = document.documentElement.getAttribute('manifest');
 if (manifestAttribute && 'serviceWorker' in navigator) {
   var manifestUrl = (new URL(manifestAttribute, location.href)).href;
 
-  var idb = require('idb');
-
-  idb.open(constants.DB_NAME, constants.DB_VERSION, function(upgradeDB) {
-    if (upgradeDB.oldVersion === 0) {
-      Object.keys(constants.OBJECT_STORES).forEach(function(objectStore) {
-        upgradeDB.createObjectStore(constants.OBJECT_STORES[objectStore]);
-      });
-    }
-  }).then(function(db) {
-    return Promise.all([
-      updateManifestAssociationForCurrentPage(db, manifestUrl),
-      handlePossibleManifestUpdate(db, manifestUrl)
-    ]);
+  openIdb().then(function(db) {
+    return checkManifestVersion(db, manifestUrl).then(function(hash) {
+      return updateManifestAssociationForCurrentPage(db, manifestUrl, hash);
+    });
   }).then(function() {
     if (swScript) {
       return navigator.serviceWorker.register(swScript);
@@ -29,39 +20,71 @@ if (manifestAttribute && 'serviceWorker' in navigator) {
 }
 
 /**
+ * Opens a connection to IndexedDB, using the idb library.
+ *
+ * @returns {Promise.<DB>}
+ */
+function openIdb() {
+  var idb = require('idb');
+  return idb.open(constants.DB_NAME, constants.DB_VERSION, function(upgradeDB) {
+    if (upgradeDB.oldVersion === 0) {
+      Object.keys(constants.OBJECT_STORES).forEach(function(objectStore) {
+        upgradeDB.createObjectStore(constants.OBJECT_STORES[objectStore]);
+      });
+    }
+  })
+}
+
+/**
  * Caches the Responses for one or more URLs, using the Cache Storage API.
  *
+ * @param {String} hash
  * @param {Array.<String>} urls
  * @returns {Promise.<T>}
  */
-function addToCache(urls) {
-  return caches.open(constants.CACHE_NAME).then(function(cache) {
+function addToCache(hash, urls) {
+  // Use the manifest hash as the name of the Cache to open.
+  return caches.open(hash).then(function(cache) {
     var fetchRequests = urls.map(function(url) {
       // See Item 18.3 of https://html.spec.whatwg.org/multipage/browsers.html#downloading-or-updating-an-application-cache
-      return fetch(new Request(url, {
+      var request = new Request(url, {
         credentials: 'include',
         headers: {
           'X-Use-Fetch': true
         },
-        mode: 'no-cors',
-        redirect: 'manual',
-        referrer: 'no-referrer'
-      })).then(function(response) {
-        // See Item 18.5 of https://html.spec.whatwg.org/multipage/browsers.html#downloading-or-updating-an-application-cache
-        if (response.status === 404 ||
-          response.status === 410 ||
-          response.headers.get('Cache-Control').indexOf('no-store') !== -1) {
-          return cache.delete(url);
+        redirect: 'manual'
+      });
+
+      return fetch(request).then(function(response) {
+        var cacheControl = response.headers.get('Cache-Control');
+        if (cacheControl && cacheControl.indexOf('no-store') !== -1) {
+          // Bail early if we're told not to cache this response.
+          return;
         }
 
         if (response.ok) {
           return cache.put(url, response);
         }
 
-        // Do nothing if the response status !== 200,404,410, which will
-        // continue to use the old item.
+        // See Item 18.5 of https://html.spec.whatwg.org/multipage/browsers.html#downloading-or-updating-an-application-cache
+        if (response.status !== 404 &&
+            response.status !== 410) {
+          // Assuming this isn't a 200, 404 or 410, we want the .catch() to
+          // trigger, which will cause any previously cached Response for this
+          // URL to be copied over to this new cache.
+          return Promise.reject();
+        }
       }).catch(function(error) {
-        // Do nothing, which will continue to use the old cached item.
+        // We're here if one of the following happens:
+        // - The fetch() rejected due to a NetworkError.
+        // - The HTTP status code from the fetch() was something other than
+        //   200, 404, and 410 AND the response isn't Cache-Control: no-store
+        return caches.match(url).then(function(response) {
+          // Add a copy of the cached response to this new cache, if it exists.
+          if (response) {
+            return cache.put(url, response.clone());
+          }
+        });
       });
     });
 
@@ -73,11 +96,13 @@ function addToCache(urls) {
  * Compares the copy of a manifest obtained from fetch() with the copy stored
  * in IndexedDB. If they differ, it kicks off the manifest update process.
  *
+ * It returns a Promise which fulfills with the hash for the current manifest.
+ *
  * @param {DB} db
  * @param {String} manifestUrl
- * @returns {Promise.<T>}
+ * @returns {Promise.<String>}
  */
-function handlePossibleManifestUpdate(db, manifestUrl) {
+function checkManifestVersion(db, manifestUrl) {
   var tx = db.transaction(constants.OBJECT_STORES.MANIFEST_URL_TO_CONTENTS);
   var store = tx.objectStore(
     constants.OBJECT_STORES.MANIFEST_URL_TO_CONTENTS);
@@ -87,9 +112,7 @@ function handlePossibleManifestUpdate(db, manifestUrl) {
     credentials: 'include',
     headers: {
       'X-Use-Fetch': true
-    },
-    mode: 'no-cors',
-    referrer: 'no-referrer'
+    }
   });
 
   return Promise.all([
@@ -97,15 +120,33 @@ function handlePossibleManifestUpdate(db, manifestUrl) {
     // TODO: Consider cache-busting if the manifest response > 24 hours old.
     fetch(manifestRequest).then(function(manifestResponse) {
       return manifestResponse.text();
+    }).then(function(text) {
+      var md5 = require('blueimp-md5');
+      return {
+        // Hash a combination of URL and text so that two identical manifests
+        // served from a different location are treated distinctly.
+        hash: md5(manifestUrl + text),
+        text: text
+      };
     }),
-    store.get(manifestUrl).then(function(idbEntryForManifest) {
-      return idbEntryForManifest ? idbEntryForManifest.text : '';
-    })
-  ]).then(function(manifestTexts) {
-    // manifestTexts[0] is the text content from the fetch().
-    // manifestTexts[1] is the text content from IDB.
-    if (manifestTexts[0] !== manifestTexts[1]) {
-      return performManifestUpdate(db, manifestUrl, manifestTexts[0]);
+    store.get(manifestUrl)
+  ]).then(function(values) {
+    // values[0].hash is the MD5 hash of the manifest returned by fetch().
+    // values[0].text is the manifest text returned by fetch().
+    // values[1] is array of Objects with {hash, parsed} properties, or null.
+    var knownManifests = values[1] || [];
+    var knownManifestVersion = knownManifests.some(function(entry) {
+      return entry.hash === values[0].hash;
+    });
+
+    if (knownManifestVersion) {
+      // If we already know about this manifest version, return the hash.
+      return values[0].hash;
+    } else {
+      // If the hash of the manifest retrieved from the network isn't already
+      // in the list of known manifest hashes, then trigger an update.
+      return performManifestUpdate(db, manifestUrl, values[0].hash,
+        values[0].text, knownManifests);
     }
   });
 }
@@ -116,56 +157,68 @@ function handlePossibleManifestUpdate(db, manifestUrl) {
  * The parsed manifest is stored in IndexedDB.
  * This also calls addToCache() to cache the relevant URLs from the manifest.
  *
+ * It returns a Promise which fulfills with the hash for the current manifest.
+ *
  * @param {DB} db
  * @param {String} manifestUrl
- * @param {String} manifestText
- * @returns {Promise.<T>}
+ * @param {String} hash
+ * @param {String} text
+ * @param {Array.<Object>} knownManifests
+ * @returns {Promise.<String>}
  */
-function performManifestUpdate(db, manifestUrl, manifestText) {
+function performManifestUpdate(db, manifestUrl, hash, text, knownManifests) {
   var parseAppCacheManifest = require('parse-appcache-manifest');
   var parsedManifest = makeManifestUrlsAbsolute(manifestUrl,
-    parseAppCacheManifest(manifestText));
+    parseAppCacheManifest(text));
 
   var tx = db.transaction(constants.OBJECT_STORES.MANIFEST_URL_TO_CONTENTS,
     'readwrite');
   var store = tx.objectStore(
     constants.OBJECT_STORES.MANIFEST_URL_TO_CONTENTS);
 
+  knownManifests.push({
+    hash: hash,
+    parsed: parsedManifest
+  });
+
   var fallbackUrls = Object.keys(parsedManifest.fallback).map(function(key) {
     return parsedManifest.fallback[key];
   });
 
   return Promise.all([
-    store.put({
-      text: manifestText,
-      parsed: parsedManifest
-    }, manifestUrl),
+    store.put(knownManifests, manifestUrl),
     // Wait on tx.complete to ensure that the transaction succeeded.
     tx.complete,
-    addToCache(parsedManifest.cache.concat(fallbackUrls))
-  ]);
+    addToCache(hash, parsedManifest.cache.concat(fallbackUrls))
+  ]).then(function() {
+    return hash;
+  });
 }
 
 /**
  * Updates IndexedDB to indicate that the current page's URL is associated
- * with the AppCache manifest at manifestUrl.
+ * with the AppCache manifest at manifestUrl, versioned with the hash.
  * It also adds the current page to the cache, matching the implicit
  * cache-as-you-go behavior you get with AppCache.
  *
  * @param {DB} db
  * @param {String} manifestUrl
+ * @param {String} hash
  * @returns {Promise.<T>}
  */
-function updateManifestAssociationForCurrentPage(db, manifestUrl) {
+function updateManifestAssociationForCurrentPage(db, manifestUrl, hash) {
   var tx = db.transaction(constants.OBJECT_STORES.PATH_TO_MANIFEST,
     'readwrite');
   var store = tx.objectStore(constants.OBJECT_STORES.PATH_TO_MANIFEST);
 
   return Promise.all([
-    store.put(manifestUrl, location.href),
+    store.put({
+      url: manifestUrl,
+      hash: hash
+    }, location.href),
     // Wait on tx.complete to ensure that the transaction succeeded.
     tx.complete,
-    addToCache([location.href])
+    addToCache(hash, [location.href])
   ]);
 }
 

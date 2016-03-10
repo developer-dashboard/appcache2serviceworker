@@ -3,6 +3,7 @@ CACHE MANIFEST
 
 CACHE:
 common.css
+../build/register-service-worker.js
 
 NETWORK:
 no-cache/
