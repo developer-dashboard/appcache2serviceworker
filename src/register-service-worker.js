@@ -28,11 +28,11 @@ function openIdb() {
   var idb = require('idb');
   return idb.open(constants.DB_NAME, constants.DB_VERSION, function(upgradeDB) {
     if (upgradeDB.oldVersion === 0) {
-      Object.keys(constants.OBJECT_STORES).forEach(function(objectStore) {
-        upgradeDB.createObjectStore(constants.OBJECT_STORES[objectStore]);
+      Object.keys(constants.STORES).forEach(function(objectStore) {
+        upgradeDB.createObjectStore(constants.STORES[objectStore]);
       });
     }
-  })
+  });
 }
 
 /**
@@ -74,7 +74,7 @@ function addToCache(hash, urls) {
           // URL to be copied over to this new cache.
           return Promise.reject();
         }
-      }).catch(function(error) {
+      }).catch(function() {
         // We're here if one of the following happens:
         // - The fetch() rejected due to a NetworkError.
         // - The HTTP status code from the fetch() was something other than
@@ -103,9 +103,9 @@ function addToCache(hash, urls) {
  * @returns {Promise.<String>}
  */
 function checkManifestVersion(db, manifestUrl) {
-  var tx = db.transaction(constants.OBJECT_STORES.MANIFEST_URL_TO_CONTENTS);
+  var tx = db.transaction(constants.STORES.MANIFEST_URL_TO_CONTENTS);
   var store = tx.objectStore(
-    constants.OBJECT_STORES.MANIFEST_URL_TO_CONTENTS);
+    constants.STORES.MANIFEST_URL_TO_CONTENTS);
 
   // See Item 4 of https://html.spec.whatwg.org/multipage/browsers.html#downloading-or-updating-an-application-cache
   var manifestRequest = new Request(manifestUrl, {
@@ -142,12 +142,12 @@ function checkManifestVersion(db, manifestUrl) {
     if (knownManifestVersion) {
       // If we already know about this manifest version, return the hash.
       return values[0].hash;
-    } else {
-      // If the hash of the manifest retrieved from the network isn't already
-      // in the list of known manifest hashes, then trigger an update.
-      return performManifestUpdate(db, manifestUrl, values[0].hash,
-        values[0].text, knownManifests);
     }
+
+    // If the hash of the manifest retrieved from the network isn't already
+    // in the list of known manifest hashes, then trigger an update.
+    return performManifestUpdate(db, manifestUrl, values[0].hash,
+      values[0].text, knownManifests);
   });
 }
 
@@ -171,10 +171,10 @@ function performManifestUpdate(db, manifestUrl, hash, text, knownManifests) {
   var parsedManifest = makeManifestUrlsAbsolute(manifestUrl,
     parseAppCacheManifest(text));
 
-  var tx = db.transaction(constants.OBJECT_STORES.MANIFEST_URL_TO_CONTENTS,
+  var tx = db.transaction(constants.STORES.MANIFEST_URL_TO_CONTENTS,
     'readwrite');
   var store = tx.objectStore(
-    constants.OBJECT_STORES.MANIFEST_URL_TO_CONTENTS);
+    constants.STORES.MANIFEST_URL_TO_CONTENTS);
 
   knownManifests.push({
     hash: hash,
@@ -197,9 +197,9 @@ function performManifestUpdate(db, manifestUrl, hash, text, knownManifests) {
 
 /**
  * Updates IndexedDB to indicate that the current page's URL is associated
- * with the AppCache manifest at manifestUrl, versioned with the hash.
- * It also adds the current page to the cache, matching the implicit
- * cache-as-you-go behavior you get with AppCache.
+ * with the AppCache manifest at manifestUrl.
+ * It also adds the current page to the cache versioned with hash, matching
+ * the implicit cache-as-you-go behavior you get with AppCache.
  *
  * @param {DB} db
  * @param {String} manifestUrl
@@ -207,15 +207,12 @@ function performManifestUpdate(db, manifestUrl, hash, text, knownManifests) {
  * @returns {Promise.<T>}
  */
 function updateManifestAssociationForCurrentPage(db, manifestUrl, hash) {
-  var tx = db.transaction(constants.OBJECT_STORES.PATH_TO_MANIFEST,
+  var tx = db.transaction(constants.STORES.PATH_TO_MANIFEST,
     'readwrite');
-  var store = tx.objectStore(constants.OBJECT_STORES.PATH_TO_MANIFEST);
+  var store = tx.objectStore(constants.STORES.PATH_TO_MANIFEST);
 
   return Promise.all([
-    store.put({
-      url: manifestUrl,
-      hash: hash
-    }, location.href),
+    store.put(manifestUrl, location.href),
     // Wait on tx.complete to ensure that the transaction succeeded.
     tx.complete,
     addToCache(hash, [location.href])

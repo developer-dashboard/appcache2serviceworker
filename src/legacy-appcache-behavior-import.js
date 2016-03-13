@@ -4,31 +4,11 @@
   'use strict';
   // Code in the ServiceWorkerGlobalScope can safely assume that a greater
   // set of ES2015 features are available, without having to transpile.
-  
+
   const log = console.debug.bind(console);
 
   const constants = require('./lib/constants.js');
-  let _db = null;
-
-  /**
-   * Gets an open instance of DB, a Promise-based wrapper on top of IndexedDB.
-   * If there's already a previously opened instance, it returns that.
-   *
-   * @returns {Promise.<DB>} The open DB instance
-   */
-  function getDbInstance() {
-    if (_db) {
-      return Promise.resolve(_db);
-    }
-
-    const idb = require('idb');
-    // The object stores will have been created by the web page prior to
-    // service worker registration.
-    return idb.open(constants.DB_NAME, constants.DB_VERSION).then(db => {
-      _db = db;
-      return _db;
-    });
-  }
+  const idb = require('./lib/idb-helpers.js');
 
   /**
    * Determines what the most likely URL is associated with the client page from
@@ -48,7 +28,6 @@
     // Otherwise, try to get the client URL using the Referer header.
     // And if that's not set, assume that it's a navigation request and the
     // effective client URL should be the request URL.
-    // TODO: Is that a reasonable assumption?
     return Promise.resolve(event.request.referrer || event.request.url);
   }
 
@@ -85,21 +64,30 @@
   }
 
   /**
+   * Checks IndexedDB for a manifest with a given URL. If found, it fulfills
+   * with info about the latest version.
+   *
+   * @param {String} manifestUrl
+   * @returns {Promise.<Object>}
+   */
+  function getLatestManifestVersion(manifestUrl) {
+    return idb.get(constants.STORES.MANIFEST_URL_TO_CONTENTS, manifestUrl).then(versions => {
+      if (versions && versions.length) {
+        return versions[versions.length - 1];
+      }
+    });
+  }
+
+  /**
    * Checks IndexedDB for a manifest with a given URL, versioned with the
    * given hash. If found, it fulfills with the parsed manifest.
    *
-   * @param db
-   * @param manifestUrl
-   * @param manifestHash
+   * @param {String} manifestUrl
+   * @param {String} manifestHash
    * @returns {Promise.<Object>}
    */
-  function getParsedManifest(db, manifestUrl, manifestHash) {
-    const tx = db.transaction(
-      constants.OBJECT_STORES.MANIFEST_URL_TO_CONTENTS);
-    const store = tx.objectStore(
-      constants.OBJECT_STORES.MANIFEST_URL_TO_CONTENTS);
-
-    return store.get(manifestUrl).then(versions => {
+  function getParsedManifestVersion(manifestUrl, manifestHash) {
+    return idb.get(constants.STORES.MANIFEST_URL_TO_CONTENTS, manifestUrl).then(versions => {
       versions = versions || [];
       log('versions is', versions);
       return versions.reduce((result, current) => {
@@ -116,6 +104,8 @@
           log('manifestHash match', current);
           return current.parsed;
         }
+
+        return null;
       }, null);
     });
   }
@@ -124,21 +114,165 @@
    * Updates the CLIENT_ID_TO_HASH store in IndexedDB with the client id to
    * hash association.
    *
-   * @param db
-   * @param clientId
-   * @param hash
+   * @param {String} clientId
+   * @param {String} hash
    * @returns {Promise.<T>}
    */
-  function saveClientIdAndHash(db, clientId, hash) {
+  function saveClientIdAndHash(clientId, hash) {
     if (clientId) {
-      const tx = db.transaction(constants.OBJECT_STORES.CLIENT_ID_TO_HASH,
-        'readwrite');
-      const store = tx.objectStore(constants.OBJECT_STORES.CLIENT_ID_TO_HASH);
-      store.put(hash, clientId);
-      return tx.complete;
+      return idb.put(constants.STORES.CLIENT_ID_TO_HASH, clientId, hash);
     }
 
+    // Return a fulfilled Promise so that we can still call .then().
     return Promise.resolve();
+  }
+
+  /**
+   * Implements the actual AppCache logic, given a specific manifest and hash
+   * used as a cache identifier.
+   *
+   * @param {FetchEvent} event
+   * @param {Object} manifest
+   * @param {String} hash
+   * @param {String} clientUrl
+   * @returns {Promise.<Response>}
+   */
+  function appCacheLogic(event, manifest, hash, clientUrl) {
+    log('manifest is', manifest, 'version is', hash);
+    const requestUrl = event.request.url;
+
+    // Is our request URL listed in the CACHES section?
+    // Or is our request URL the client URL, since any page that
+    // registers a manifest is treated as if it were in the CACHE?
+    if (manifest.cache.includes(requestUrl) || requestUrl === clientUrl) {
+      log('CACHE includes URL; using cache.match()');
+      // If so, return the cached response.
+      return caches.open(hash).then(cache => cache.match(requestUrl));
+    }
+
+    // Otherwise, check the FALLBACK section next.
+    // FALLBACK keys are URL prefixes, and if more than one prefix
+    // matches our request URL, the longest prefix "wins".
+    // (Of course, it might be that none of the prefixes match.)
+    const fallbackKey = longestMatchingPrefix(Object.keys(manifest.fallback),
+      requestUrl);
+    if (fallbackKey) {
+      log('fallbackKey in parsedManifest matches', fallbackKey);
+      return fetchWithFallback(event.request, manifest.fallback[fallbackKey],
+        hash);
+    }
+
+    // If CACHE and FALLBACK don't apply, try NETWORK.
+    if (manifest.network.includes(requestUrl) ||
+        manifest.network.includes('*')) {
+      log('Match or * in NETWORK; using fetch()');
+      return fetch(event.request);
+    }
+
+    // If nothing matches, then return an error response.
+    log('Nothing matches; using Response.error()');
+    return Response.error();
+  }
+
+  /**
+   * The behavior when there's a matching manifest for our client URL.
+   *
+   * @param {FetchEvent} event
+   * @param {String} manifestUrl
+   * @param {String} clientUrl
+   * @returns {Promise.<Response>}
+   */
+  function manifestBehavior(event, manifestUrl, clientUrl) {
+    if (event.clientId) {
+      return idb.get(constants.STORES.CLIENT_ID_TO_HASH, event.clientId).then(hash => {
+        // If we already have a hash assigned to this client id, use that manifest
+        // to implement the AppCache logic.
+        if (hash) {
+          return getParsedManifestVersion(manifestUrl, hash).then(
+            parsedManifest => appCacheLogic(event, parsedManifest, hash, clientUrl));
+        }
+
+        // If there's isn't yet a hash for this client id, then get the latest
+        // version of the manifest, and use that to implement AppCache logic.
+        // Also, establish the client id to hash mapping for future use.
+        return getLatestManifestVersion(manifestUrl).then(latest => {
+          return saveClientIdAndHash(event.clientId, latest.hash).then(() => {
+            return appCacheLogic(event, latest.parsed, latest.hash, clientUrl);
+          });
+        });
+      });
+    }
+
+    // If there's no client id, then just use the latest version of the
+    // manifest to implement AppCache logic.
+    return getLatestManifestVersion(manifestUrl).then(
+      latest => appCacheLogic(event, latest.parsed, latest.hash, clientUrl));
+  }
+
+  /**
+   * The behavior when there is no matching manifest for our client URL.
+   *
+   * @param {FetchEvent} event
+   * @returns {Promise.<Response>}
+   */
+  function noManifestBehavior(event) {
+    // If we fall through to this point, then we don't have a known
+    // manifest associated with the client making the request.
+    // We now need to check to see if our request URL matches a prefix
+    // from the FALLBACK section of *any* manifest in our origin. If
+    // there are multiple matches, the longest prefix wins. If there are
+    // multiple prefixes of the same length in different manifest, then
+    // the one returned last from IDB wins. (This might not match
+    // browser behavior.)
+    // See https://www.w3.org/TR/2011/WD-html5-20110525/offline.html#concept-appcache-matches-fallback
+    return idb.getAll(constants.STORES.MANIFEST_URL_TO_CONTENTS).then(manifests => {
+      log('All manifests:', manifests);
+      // Use .map() to create an array of the longest matching prefix
+      // for each manifest. If no prefixes match for a given manifest,
+      // the value will be ''.
+      const longestForEach = manifests.map(manifestVersions => {
+        // Use the latest version of a given manifest.
+        const parsedManifest =
+          manifestVersions[manifestVersions.length - 1].parsed;
+        return longestMatchingPrefix(
+          Object.keys(parsedManifest.fallback), event.request.url);
+      });
+      log('longestForEach:', longestForEach);
+
+      // Next, find which of the longest matching prefixes from each
+      // manifest is the longest overall. Return both the index of the
+      // manifest in which that match appears and the prefix itself.
+      const longest = longestForEach.reduce((soFar, current, i) => {
+        if (current.length >= soFar.prefix.length) {
+          return {prefix: current, index: i};
+        }
+
+        return soFar;
+      }, {prefix: '', index: 0});
+      log('longest:', longest);
+
+      // Now that we know the longest overall prefix, we'll use that
+      // to lookup the fallback URL value in the winning manifest.
+      const fallbackKey = longest.prefix;
+      log('fallbackKey:', fallbackKey);
+      if (fallbackKey) {
+        const winningManifest = manifests[longest.index];
+        log('winningManifest:', winningManifest);
+        const winningManifestVersion =
+          winningManifest[winningManifest.length - 1];
+        log('winningManifestVersion:', winningManifestVersion);
+        const hash =
+          winningManifest[winningManifest.length - 1].hash;
+        const parsedManifest =
+          winningManifest[winningManifest.length - 1].parsed;
+        return fetchWithFallback(event.request,
+          parsedManifest.fallback[fallbackKey], hash);
+      }
+
+      // If nothing matches, then just fetch().
+      log('Nothing at all matches. Using fetch()');
+      return fetch(event.request);
+    });
   }
 
   /**
@@ -159,158 +293,17 @@
       return fetch(event.request);
     }
 
-    // TODO: Use the client id mappings when possible.
-    // Refactor this code.
-    return getDbInstance().then(db => {
-      return getClientUrlForEvent(event).then(clientUrl => {
-        log('clientUrl is', clientUrl);
-        if (clientUrl) {
-          const tx = db.transaction(
-            constants.OBJECT_STORES.PATH_TO_MANIFEST);
-          const store = tx.objectStore(
-            constants.OBJECT_STORES.PATH_TO_MANIFEST);
-          return store.get(clientUrl).then(manifestForClient => {
-            log('manifestForClient is', manifestForClient);
+    return getClientUrlForEvent(event).then(clientUrl => {
+      log('clientUrl is', clientUrl);
+      return idb.get(constants.STORES.PATH_TO_MANIFEST, clientUrl).then(manifestUrl => {
+        log('manifestUrl is', manifestUrl);
 
-            // Now, the complicated bit. First, see if we have a manifest
-            // associated with the client.
-            if (manifestForClient) {
-              const url = manifestForClient.url;
-              const hash = manifestForClient.hash;
-
-              // Save the mapping between the current client id and hash.
-              return saveClientIdAndHash(db, event.clientId, hash).then(() => {
-                return getParsedManifest(db, url, hash)
-              }).then(parsedManifest => {
-                log('parsedManifest is', parsedManifest);
-                // Is our request URL listed in the CACHES section?
-                // Or is our request URL the client URL, since any page that
-                // registers a manifest is treated as if it were in the CACHE?
-                if (parsedManifest.cache.includes(requestUrl) ||
-                    requestUrl === clientUrl) {
-                  log('CACHE includes URL; using cache.match()');
-                  // If so, return the cached response.
-                  return caches.open(manifestForClient.hash).then(
-                    cache => cache.match(requestUrl));
-                }
-
-                // Otherwise, check the FALLBACK section next.
-                // FALLBACK keys are URL prefixes, and if more than one prefix
-                // matches our request URL, the longest prefix "wins".
-                // (Of course, it might be that none of the prefixes match.)
-                const fallbackKey = longestMatchingPrefix(
-                  Object.keys(parsedManifest.fallback), requestUrl);
-                if (fallbackKey) {
-                  log('fallbackKey in parsedManifest matches', fallbackKey);
-                  return fetchWithFallback(event.request,
-                    parsedManifest.fallback[fallbackKey],
-                    manifestForClient.hash);
-                }
-
-                // If CACHE and FALLBACK don't apply, try NETWORK.
-                if (parsedManifest.network.includes(requestUrl) ||
-                  parsedManifest.network.includes('*')) {
-                  log('Match or * in NETWORK; using fetch()');
-                  return fetch(event.request);
-                }
-
-                // If nothing matches, then return an error response.
-                // TODO: Is returning Response.error() the best approach?
-                log('Nothing matches; using Response.error()');
-                return Response.error();
-              });
-            }
-
-            log('No matching manifest for client found.');
-            // If we fall through to this point, then we don't have a known
-            // manifest associated with the client making the request.
-            // We now need to check to see if our request URL matches a prefix
-            // from the FALLBACK section of *any* manifest in our origin. If
-            // there are multiple matches, the longest prefix wins. If there are
-            // multiple prefixes of the same length in different manifest, then
-            // the one returned last from IDB wins. (This might not match
-            // browser behavior.)
-            // See https://www.w3.org/TR/2011/WD-html5-20110525/offline.html#concept-appcache-matches-fallback
-            const tx = db.transaction(
-              constants.OBJECT_STORES.MANIFEST_URL_TO_CONTENTS);
-            const store = tx.objectStore(
-              constants.OBJECT_STORES.MANIFEST_URL_TO_CONTENTS);
-            return store.getAll().then(manifests => {
-              log('All manifests:', manifests);
-              // Use .map() to create an array of the longest matching prefix
-              // for each manifest. If no prefixes match for a given manifest,
-              // the value will be ''.
-              const longestForEach = manifests.map(manifestVersions => {
-                // Use the latest version of a given manifest.
-                const parsedManifest =
-                  manifestVersions[manifestVersions.length - 1].parsed;
-                return longestMatchingPrefix(
-                  Object.keys(parsedManifest.fallback), requestUrl);
-              });
-              log('longestForEach:', longestForEach);
-
-              // Next, find which of the longest matching prefixes from each
-              // manifest is the longest overall. Return both the index of the
-              // manifest in which that match appears and the prefix itself.
-              const longest = longestForEach.reduce((soFar, current, i) => {
-                if (current.length >= soFar.prefix.length) {
-                  return {prefix: current, index: i};
-                }
-
-                return soFar;
-              }, {prefix: '', index: 0});
-              log('longest:', longest);
-
-              // Now that we know the longest overall prefix, we'll use that
-              // to lookup the fallback URL value in the winning manifest.
-              const fallbackKey = longest.prefix;
-              log('fallbackKey:', fallbackKey);
-              if (fallbackKey) {
-                const winningManifest = manifests[longest.index];
-                log('winningManifest:', winningManifest);
-                const winningManifestVersion =
-                  winningManifest[winningManifest.length - 1];
-                log('winningManifestVersion:', winningManifestVersion);
-                const hash =
-                  winningManifest[winningManifest.length - 1].hash;
-                const parsedManifest =
-                  winningManifest[winningManifest.length - 1].parsed;
-                return fetchWithFallback(event.request,
-                  parsedManifest.fallback[fallbackKey], hash);
-              }
-
-              // If nothing matches, then just fetch().
-              log('Nothing at all matches. Using fetch()');
-              return fetch(event.request);
-            });
-          });
+        if (manifestUrl) {
+          return manifestBehavior(event, manifestUrl, clientUrl);
         }
-      });
-    });
-  }
 
-  /**
-   * Fulfills with an array of all the hash ids that correspond to outdated
-   * manifest versions.
-   *
-   * @returns {Promise.<String>}
-   */
-  function getHashesOfOlderVersions() {
-    return getDbInstance().then(db => {
-      const tx = db.transaction(
-        constants.OBJECT_STORES.MANIFEST_URL_TO_CONTENTS);
-      const store = tx.objectStore(
-        constants.OBJECT_STORES.MANIFEST_URL_TO_CONTENTS);
-
-      return store.getAll().then(manifests => {
-        return manifests.map(versions => {
-          // versions.slice(0, -1) will give all the versions other than the
-          // last, or [] if there's aren't any older versions.
-          return versions.slice(0, -1)
-            .map(version => version.hash);
-        }).reduce((prev, curr) => {
-          return prev.concat(curr);
-        }, []);
+        log('No matching manifest for client found.');
+        return noManifestBehavior(event);
       });
     });
   }
@@ -322,33 +315,37 @@
    * 3. Delete the inactive entries from IndexedDB's CLIENT_ID_TO_HASH
    * 4. For each inactive one, return the corresponding hash association.
    *
-   * @param idsOfActiveClients
+   * @param {Array.<String>} idsOfActiveClients
    * @returns {Promise.<Array.<String>>}
    */
   function cleanupClientIdAndHash(idsOfActiveClients) {
-    return getDbInstance().then(db => {
-      const readTx = db.transaction(constants.OBJECT_STORES.CLIENT_ID_TO_HASH);
-      const readStore = readTx.objectStore(
-        constants.OBJECT_STORES.CLIENT_ID_TO_HASH);
-      return readStore.getAllKeys().then(allKnownIds => {
-        return allKnownIds.filter(id => !idsOfActiveClients.includes(id));
-      }).then(idsOfInactiveClients => {
-        return Promise.all(idsOfInactiveClients.map(id => {
-          const readTx = db.transaction(
-            constants.OBJECT_STORES.CLIENT_ID_TO_HASH);
-          const readStore = readTx.objectStore(
-            constants.OBJECT_STORES.CLIENT_ID_TO_HASH);
+    return idb.getAllKeys(constants.STORES.CLIENT_ID_TO_HASH).then(allKnownIds => {
+      return allKnownIds.filter(id => !idsOfActiveClients.includes(id));
+    }).then(idsOfInactiveClients => {
+      return Promise.all(idsOfInactiveClients.map(id => {
+        return idb.get(constants.STORES.CLIENT_ID_TO_HASH, id).then(hash => {
+          return idb.delete(constants.STORES.CLIENT_ID_TO_HASH, id).then(() => hash);
+        });
+      }));
+    });
+  }
 
-          return readStore.get(id).then(hash => {
-            const writeTx = db.transaction(
-              constants.OBJECT_STORES.CLIENT_ID_TO_HASH, 'readwrite');
-            const writeStore = writeTx.objectStore(
-              constants.OBJECT_STORES.CLIENT_ID_TO_HASH);
-            writeStore.delete(id);
-            return writeTx.complete.then(() => hash);
-          });
-        }));
-      });
+  /**
+   * Fulfills with an array of all the hash ids that correspond to outdated
+   * manifest versions.
+   *
+   * @returns {Promise.<Array.<String>>}
+   */
+  function getHashesOfOlderVersions() {
+    return idb.getAll(constants.STORES.MANIFEST_URL_TO_CONTENTS).then(manifests => {
+      return manifests.map(versions => {
+        // versions.slice(0, -1) will give all the versions other than the
+        // last, or [] if there's aren't any older versions.
+        return versions.slice(0, -1).map(version => version.hash);
+      }).reduce((prev, curr) => {
+        // Flatten the array-of-arrays into an array.
+        return prev.concat(curr);
+      }, []);
     });
   }
 
@@ -361,6 +358,8 @@
    *    that correspond to out-of-date manifest versions.
    * 4. If there's a match between an out of date hash and a hash that is no
    *    longer being used by a client, then it deletes the corresponding cache.
+   *
+   * @returns {Promise.<T>}
    */
   function cleanupOldCaches() {
     self.clients.matchAll().then(clients => {
@@ -389,6 +388,7 @@
    * @returns {Promise.<Response>}
    */
   global.legacyAppCacheBehavior = event => {
+    log('client id is', event.clientId);
     return appCacheBehaviorForEvent(event).then(response => {
       // If this is a navigation, clean up unused caches that correspond to old
       // AppCache manifest versions which are no longer associated with an
@@ -400,7 +400,7 @@
 
       return response;
     }).catch(error => {
-      console.warn(`No AppCache behavior for ${event.request.url}:`, error);
+      console.warn('No AppCache behavior for', event.request.url, error);
       // TODO: Is it sensible to use fetch() here as a fallback?
       return fetch(event.request);
     });
