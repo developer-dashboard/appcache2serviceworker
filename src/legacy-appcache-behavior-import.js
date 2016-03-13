@@ -5,7 +5,7 @@
   // Code in the ServiceWorkerGlobalScope can safely assume that a greater
   // set of ES2015 features are available, without having to transpile.
   
-  const log = console.debug;
+  const log = console.debug.bind(console);
 
   const constants = require('./lib/constants.js');
   let _db = null;
@@ -151,7 +151,6 @@
   function appCacheBehaviorForEvent(event) {
     const requestUrl = event.request.url;
     log('Starting appCacheBehaviorForUrl for', requestUrl);
-    log('X-Use-Fetch is', event.request.headers.get('X-Use-Fetch'));
 
     // If this is a request that, as per the AppCache spec, should be handled
     // via a direct fetch(), then do that and bail early.
@@ -160,6 +159,8 @@
       return fetch(event.request);
     }
 
+    // TODO: Use the client id mappings when possible.
+    // Refactor this code.
     return getDbInstance().then(db => {
       return getClientUrlForEvent(event).then(clientUrl => {
         log('clientUrl is', clientUrl);
