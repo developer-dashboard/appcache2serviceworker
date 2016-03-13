@@ -56,7 +56,14 @@
    */
   function fetchWithFallback(request, fallbackUrl, cacheName) {
     log('Trying fetch for', request.url);
-    return fetch(request).catch(() => {
+    return fetch(request).then(response => {
+      // Succesful but error-like responses are treated as failures.
+      // Ditto for redirects to other origins.
+      if (!response.ok || (new URL(response.url).origin !== location.origin)) {
+        throw Error('Fallback request failure.');
+      }
+      return response;
+    }).catch(() => {
       log('fetch() failed. Falling back to cache of', fallbackUrl);
       return caches.open(cacheName).then(
         cache => cache.match(fallbackUrl));
@@ -283,13 +290,20 @@
    * @returns {Promise.<Response>}
    */
   function appCacheBehaviorForEvent(event) {
-    const requestUrl = event.request.url;
-    log('Starting appCacheBehaviorForUrl for', requestUrl);
+    const requestUrl = new URL(event.request.url);
+    log('Starting appCacheBehaviorForUrl for ' + requestUrl);
 
     // If this is a request that, as per the AppCache spec, should be handled
     // via a direct fetch(), then do that and bail early.
     if (event.request.headers.get('X-Use-Fetch') === 'true') {
       log('Using fetch() because X-Use-Fetch: true');
+      return fetch(event.request);
+    }
+
+    // Appcache rules only apply to GETs & same-scheme requests.
+    if (event.request.method !== 'GET' ||
+        requestURL.scheme != location.scheme) {
+      log('Using fetch() because AppCache does not apply to this request.');
       return fetch(event.request);
     }
 
