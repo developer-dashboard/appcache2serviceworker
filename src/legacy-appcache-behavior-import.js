@@ -16,19 +16,27 @@
    * AppCache manifest's rules should be applied.
    *
    * @param {FetchEvent} event
-   * @returns {String} The client URL
+   * @returns {Promise.<String>} The client URL
    */
   function getClientUrlForEvent(event) {
     // If our service worker implementation supports client identifiers, try
     // to get the client URL using that.
-    if (global.clients && global.clients.get && event.clientId) {
-      return global.clients.get(event.clientId).then(client => client.url);
-    }
+    return global.clients.get(event.clientId)
+      .then(client => client.url)
+      // If those aren't supported, .catch() any errors and try something else.
+      .catch(error => {
+        log('Error while using clients.get(event.clientId).url: ' + error);
+        // Firefox currently sets the referer to 'about:client' for initial
+        // navigations, but that's not useful for our purposes.
+        if (event.request.referrer &&
+            event.request.referrer !== 'about:client') {
+          return event.request.referrer;
+        }
 
-    // Otherwise, try to get the client URL using the Referer header.
-    // And if that's not set, assume that it's a navigation request and the
-    // effective client URL should be the request URL.
-    return Promise.resolve(event.request.referrer || event.request.url);
+        // Use the event's request URL as the last resort, with the assumption
+        // that this is a navigation request.
+        return event.request.url;
+      });
   }
 
   /**
@@ -78,11 +86,12 @@
    * @returns {Promise.<Object>}
    */
   function getLatestManifestVersion(manifestUrl) {
-    return idb.get(constants.STORES.MANIFEST_URL_TO_CONTENTS, manifestUrl).then(versions => {
-      if (versions && versions.length) {
-        return versions[versions.length - 1];
-      }
-    });
+    return idb.get(constants.STORES.MANIFEST_URL_TO_CONTENTS, manifestUrl)
+      .then(versions => {
+        if (versions && versions.length) {
+          return versions[versions.length - 1];
+        }
+      });
   }
 
   /**
@@ -94,27 +103,28 @@
    * @returns {Promise.<Object>}
    */
   function getParsedManifestVersion(manifestUrl, manifestHash) {
-    return idb.get(constants.STORES.MANIFEST_URL_TO_CONTENTS, manifestUrl).then(versions => {
-      versions = versions || [];
-      log('versions is', versions);
-      return versions.reduce((result, current) => {
-        log('current is', current);
-        // If we already have a result, just keep returning it.
-        if (result) {
-          log('result is', result);
-          return result;
-        }
+    return idb.get(constants.STORES.MANIFEST_URL_TO_CONTENTS, manifestUrl)
+      .then(versions => {
+        versions = versions || [];
+        log('versions is', versions);
+        return versions.reduce((result, current) => {
+          log('current is', current);
+          // If we already have a result, just keep returning it.
+          if (result) {
+            log('result is', result);
+            return result;
+          }
 
-        // Otherwise, check to see if the hashes match. If so, use the parsed
-        // manifest for the current entry as the result.
-        if (current.hash === manifestHash) {
-          log('manifestHash match', current);
-          return current.parsed;
-        }
+          // Otherwise, check to see if the hashes match. If so, use the parsed
+          // manifest for the current entry as the result.
+          if (current.hash === manifestHash) {
+            log('manifestHash match', current);
+            return current.parsed;
+          }
 
-        return null;
-      }, null);
-    });
+          return null;
+        }, null);
+      });
   }
 
   /**
@@ -191,23 +201,25 @@
    */
   function manifestBehavior(event, manifestUrl, clientUrl) {
     if (event.clientId) {
-      return idb.get(constants.STORES.CLIENT_ID_TO_HASH, event.clientId).then(hash => {
-        // If we already have a hash assigned to this client id, use that manifest
-        // to implement the AppCache logic.
-        if (hash) {
-          return getParsedManifestVersion(manifestUrl, hash).then(
-            parsedManifest => appCacheLogic(event, parsedManifest, hash, clientUrl));
-        }
+      return idb.get(constants.STORES.CLIENT_ID_TO_HASH, event.clientId)
+        .then(hash => {
+          // If we already have a hash assigned to this client id, use that
+          // manifest to implement the AppCache logic.
+          if (hash) {
+            return getParsedManifestVersion(manifestUrl, hash)
+              .then(parsedManifest => appCacheLogic(event, parsedManifest, hash,
+                clientUrl));
+          }
 
-        // If there's isn't yet a hash for this client id, then get the latest
-        // version of the manifest, and use that to implement AppCache logic.
-        // Also, establish the client id to hash mapping for future use.
-        return getLatestManifestVersion(manifestUrl).then(latest => {
-          return saveClientIdAndHash(event.clientId, latest.hash).then(() => {
-            return appCacheLogic(event, latest.parsed, latest.hash, clientUrl);
+          // If there's isn't yet a hash for this client id, then get the latest
+          // version of the manifest, and use that to implement AppCache logic.
+          // Also, establish the client id to hash mapping for future use.
+          return getLatestManifestVersion(manifestUrl).then(latest => {
+            return saveClientIdAndHash(event.clientId, latest.hash)
+              .then(() => appCacheLogic(event, latest.parsed, latest.hash,
+                clientUrl));
           });
         });
-      });
     }
 
     // If there's no client id, then just use the latest version of the
@@ -232,54 +244,53 @@
     // the one returned last from IDB wins. (This might not match
     // browser behavior.)
     // See https://www.w3.org/TR/2011/WD-html5-20110525/offline.html#concept-appcache-matches-fallback
-    return idb.getAll(constants.STORES.MANIFEST_URL_TO_CONTENTS).then(manifests => {
-      log('All manifests:', manifests);
-      // Use .map() to create an array of the longest matching prefix
-      // for each manifest. If no prefixes match for a given manifest,
-      // the value will be ''.
-      const longestForEach = manifests.map(manifestVersions => {
-        // Use the latest version of a given manifest.
-        const parsedManifest =
-          manifestVersions[manifestVersions.length - 1].parsed;
-        return longestMatchingPrefix(
-          Object.keys(parsedManifest.fallback), event.request.url);
-      });
-      log('longestForEach:', longestForEach);
+    return idb.getAll(constants.STORES.MANIFEST_URL_TO_CONTENTS)
+      .then(manifests => {
+        log('All manifests:', manifests);
+        // Use .map() to create an array of the longest matching prefix
+        // for each manifest. If no prefixes match for a given manifest,
+        // the value will be ''.
+        const longestForEach = manifests.map(manifestVersions => {
+          // Use the latest version of a given manifest.
+          const parsedManifest =
+            manifestVersions[manifestVersions.length - 1].parsed;
+          return longestMatchingPrefix(
+            Object.keys(parsedManifest.fallback), event.request.url);
+        });
+        log('longestForEach:', longestForEach);
 
-      // Next, find which of the longest matching prefixes from each
-      // manifest is the longest overall. Return both the index of the
-      // manifest in which that match appears and the prefix itself.
-      const longest = longestForEach.reduce((soFar, current, i) => {
-        if (current.length >= soFar.prefix.length) {
-          return {prefix: current, index: i};
+        // Next, find which of the longest matching prefixes from each
+        // manifest is the longest overall. Return both the index of the
+        // manifest in which that match appears and the prefix itself.
+        const longest = longestForEach.reduce((soFar, current, i) => {
+          if (current.length >= soFar.prefix.length) {
+            return {prefix: current, index: i};
+          }
+
+          return soFar;
+        }, {prefix: '', index: 0});
+        log('longest:', longest);
+
+        // Now that we know the longest overall prefix, we'll use that
+        // to lookup the fallback URL value in the winning manifest.
+        const fallbackKey = longest.prefix;
+        log('fallbackKey:', fallbackKey);
+        if (fallbackKey) {
+          const winningManifest = manifests[longest.index];
+          log('winningManifest:', winningManifest);
+          const winningManifestVersion =
+            winningManifest[winningManifest.length - 1];
+          log('winningManifestVersion:', winningManifestVersion);
+          const hash = winningManifestVersion.hash;
+          const parsedManifest = winningManifestVersion.parsed;
+          return fetchWithFallback(event.request,
+            parsedManifest.fallback[fallbackKey], hash);
         }
 
-        return soFar;
-      }, {prefix: '', index: 0});
-      log('longest:', longest);
-
-      // Now that we know the longest overall prefix, we'll use that
-      // to lookup the fallback URL value in the winning manifest.
-      const fallbackKey = longest.prefix;
-      log('fallbackKey:', fallbackKey);
-      if (fallbackKey) {
-        const winningManifest = manifests[longest.index];
-        log('winningManifest:', winningManifest);
-        const winningManifestVersion =
-          winningManifest[winningManifest.length - 1];
-        log('winningManifestVersion:', winningManifestVersion);
-        const hash =
-          winningManifest[winningManifest.length - 1].hash;
-        const parsedManifest =
-          winningManifest[winningManifest.length - 1].parsed;
-        return fetchWithFallback(event.request,
-          parsedManifest.fallback[fallbackKey], hash);
-      }
-
-      // If nothing matches, then just fetch().
-      log('Nothing at all matches. Using fetch()');
-      return fetch(event.request);
-    });
+        // If nothing matches, then just fetch().
+        log('Nothing at all matches. Using fetch()');
+        return fetch(event.request);
+      });
   }
 
   /**
@@ -302,23 +313,24 @@
 
     // Appcache rules only apply to GETs & same-scheme requests.
     if (event.request.method !== 'GET' ||
-        requestURL.scheme != location.scheme) {
+        requestUrl.protocol !== location.protocol) {
       log('Using fetch() because AppCache does not apply to this request.');
       return fetch(event.request);
     }
 
     return getClientUrlForEvent(event).then(clientUrl => {
       log('clientUrl is', clientUrl);
-      return idb.get(constants.STORES.PATH_TO_MANIFEST, clientUrl).then(manifestUrl => {
-        log('manifestUrl is', manifestUrl);
+      return idb.get(constants.STORES.PATH_TO_MANIFEST, clientUrl)
+        .then(manifestUrl => {
+          log('manifestUrl is', manifestUrl);
 
-        if (manifestUrl) {
-          return manifestBehavior(event, manifestUrl, clientUrl);
-        }
+          if (manifestUrl) {
+            return manifestBehavior(event, manifestUrl, clientUrl);
+          }
 
-        log('No matching manifest for client found.');
-        return noManifestBehavior(event);
-      });
+          log('No matching manifest for client found.');
+          return noManifestBehavior(event);
+        });
     });
   }
 
@@ -333,15 +345,17 @@
    * @returns {Promise.<Array.<String>>}
    */
   function cleanupClientIdAndHash(idsOfActiveClients) {
-    return idb.getAllKeys(constants.STORES.CLIENT_ID_TO_HASH).then(allKnownIds => {
-      return allKnownIds.filter(id => !idsOfActiveClients.includes(id));
-    }).then(idsOfInactiveClients => {
-      return Promise.all(idsOfInactiveClients.map(id => {
-        return idb.get(constants.STORES.CLIENT_ID_TO_HASH, id).then(hash => {
-          return idb.delete(constants.STORES.CLIENT_ID_TO_HASH, id).then(() => hash);
-        });
-      }));
-    });
+    return idb.getAllKeys(constants.STORES.CLIENT_ID_TO_HASH)
+      .then(allKnownIds => {
+        return allKnownIds.filter(id => !idsOfActiveClients.includes(id));
+      }).then(idsOfInactiveClients => {
+        return Promise.all(idsOfInactiveClients.map(id => {
+          return idb.get(constants.STORES.CLIENT_ID_TO_HASH, id).then(hash => {
+            return idb.delete(constants.STORES.CLIENT_ID_TO_HASH, id)
+              .then(() => hash);
+          });
+        }));
+      });
   }
 
   /**
@@ -351,16 +365,17 @@
    * @returns {Promise.<Array.<String>>}
    */
   function getHashesOfOlderVersions() {
-    return idb.getAll(constants.STORES.MANIFEST_URL_TO_CONTENTS).then(manifests => {
-      return manifests.map(versions => {
-        // versions.slice(0, -1) will give all the versions other than the
-        // last, or [] if there's aren't any older versions.
-        return versions.slice(0, -1).map(version => version.hash);
-      }).reduce((prev, curr) => {
-        // Flatten the array-of-arrays into an array.
-        return prev.concat(curr);
-      }, []);
-    });
+    return idb.getAll(constants.STORES.MANIFEST_URL_TO_CONTENTS)
+      .then(manifests => {
+        return manifests.map(versions => {
+          // versions.slice(0, -1) will give all the versions other than the
+          // last, or [] if there's aren't any older versions.
+          return versions.slice(0, -1).map(version => version.hash);
+        }).reduce((prev, curr) => {
+          // Flatten the array-of-arrays into an array.
+          return prev.concat(curr);
+        }, []);
+      });
   }
 
   /**
@@ -376,7 +391,7 @@
    * @returns {Promise.<T>}
    */
   function cleanupOldCaches() {
-    self.clients.matchAll().then(clients => {
+    global.clients.matchAll().then(clients => {
       return clients.map(client => client.id);
     }).then(idsOfActiveClients => {
       return cleanupClientIdAndHash(idsOfActiveClients);
@@ -395,8 +410,26 @@
   }
 
   /**
-   * A wrapper on top of appCacheBehaviorForEvent() that handles rejections with
-   * a default of fetch().
+   * The main entry point into the App Cache Behavior library.
+   * It is meant to be called by a service worker's fetch event handler:
+   *
+   *     self.addEventListener('fetch', event => {
+   *       event.respondWith(legacyAppCacheBehavior(event).catch(error => {
+   *         // Fallback behavior goes here, e.g. return fetch(event.request);
+   *       }));
+   *     });
+   *
+   * legacyAppCacheBehavior() can be selectively applied to only a subset of
+   * requests, to aid in the migration off of App Cache and onto a more robust
+   * service worker implementation:
+   *
+   *     self.addEventListener('fetch', event => {
+   *       if (event.request.url.match(/legacyRegex/)) {
+   *         event.respondWith(legacyAppCacheBehavior(event));
+   *       } else {
+   *         event.respondWith(robustServiceWorkerBehavior(event));
+   *       }
+   *     });
    *
    * @param {FetchEvent} event
    * @returns {Promise.<Response>}
@@ -413,10 +446,6 @@
       }
 
       return response;
-    }).catch(error => {
-      console.warn('No AppCache behavior for', event.request.url, error);
-      // TODO: Is it sensible to use fetch() here as a fallback?
-      return fetch(event.request);
     });
   };
 })(self);
